@@ -1628,7 +1628,18 @@ class DesktopTests : public QObject
         QTRY_VERIFY(qAbs(quoteArea->mapToGlobal(quoteArea->rect().center()).y() -
                          send->mapToGlobal(send->rect().center()).y()) <= 1);
         QVERIFY(!isolated.findChild<QLabel *>("notice"));
-        const auto composeTop = composer->mapToGlobal(QPoint()).y();
+        // Let the queued quote and attachment layout settle before sampling. The compose area grows from
+        // its floor to its quote height on shorter windows, so a mid-flight sample would move on its own.
+        int settledTop = composer->mapToGlobal(QPoint()).y();
+        for (int attempt = 0; attempt < 10; ++attempt)
+        {
+            QCoreApplication::processEvents();
+            const int currentTop = composer->mapToGlobal(QPoint()).y();
+            if (currentTop == settledTop)
+                break;
+            settledTop = currentTop;
+        }
+        const auto composeTop = settledTop;
         transport->warning("synthetic transport failure");
         QTest::qWait(20);
         QCOMPARE(composer->mapToGlobal(QPoint()).y(), composeTop);

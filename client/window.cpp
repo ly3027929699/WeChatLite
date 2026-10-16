@@ -183,8 +183,13 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     setWindowTitle("微信轻聊");
     setWindowIcon(appIcon());
     setWindowFlag(Qt::FramelessWindowHint);
-    resize(1095, 1178);
-    setMinimumSize(760, 660);
+    // Default to 1280x720, but never open larger than the usable desktop: a hard-coded size overflows
+    // smaller displays and pushes the window controls off-screen where they cannot be reached.
+    const QRect available = screen() ? screen()->availableGeometry() : QRect(0, 0, 1280, 720);
+    const int defaultWidth = qBound(qMin(760, available.width()), 1280, available.width());
+    const int defaultHeight = qBound(qMin(660, available.height()), 720, available.height());
+    resize(defaultWidth, defaultHeight);
+    setMinimumSize(qMin(760, available.width()), qMin(660, available.height()));
     setAcceptDrops(true);
     makeUi();
     refreshThemeIcons();
@@ -695,13 +700,60 @@ bool Window::eventFilter(QObject *watched, QEvent *event)
             return true;
         }
     }
-    if (watched->property("resizeEdge").isValid() && event->type() == QEvent::MouseButtonPress &&
-        !isMaximized() && windowHandle())
+    if (watched->property("resizeEdge").isValid() && !isMaximized() && windowHandle())
     {
-        windowHandle()->startSystemResize(Qt::Edges(watched->property("resizeEdge").toInt()));
-        return true;
+        const auto edges = Qt::Edges(watched->property("resizeEdge").toInt());
+        if (event->type() == QEvent::MouseButtonPress &&
+            static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton)
+        {
+            // macOS cocoa does not implement startSystemResize: it returns false and no drag ever
+            // starts, which made every edge handle swallow the press. Fall back to resizing here.
+            if (!windowHandle()->startSystemResize(edges))
+                beginManualResize(edges, static_cast<QMouseEvent *>(event)->globalPosition().toPoint(),
+                                  static_cast<QWidget *>(watched));
+            return true;
+        }
+        if (event->type() == QEvent::MouseMove && manualResizeHandle.data() == watched)
+        {
+            applyManualResize(static_cast<QMouseEvent *>(event)->globalPosition().toPoint());
+            return true;
+        }
+        if (event->type() == QEvent::MouseButtonRelease && manualResizeHandle.data() == watched)
+        {
+            finishManualResize();
+            return true;
+        }
     }
     return QMainWindow::eventFilter(watched, event);
+}
+void Window::beginManualResize(Qt::Edges edges, const QPoint &globalPos, QWidget *handle)
+{
+    manualResizeHandle = handle;
+    manualResizeEdges = edges;
+    manualResizeOrigin = globalPos;
+    manualResizeGeometry = geometry();
+}
+void Window::applyManualResize(const QPoint &globalPos)
+{
+    if (!manualResizeHandle || manualResizeEdges == Qt::Edges())
+        return;
+    const QPoint delta = globalPos - manualResizeOrigin;
+    QRect target = manualResizeGeometry;
+    const int minWidth = minimumWidth(), minHeight = minimumHeight();
+    if (manualResizeEdges.testFlag(Qt::LeftEdge))
+        target.setLeft(qMin(target.left() + delta.x(), target.right() - minWidth + 1));
+    if (manualResizeEdges.testFlag(Qt::RightEdge))
+        target.setRight(qMax(target.right() + delta.x(), target.left() + minWidth - 1));
+    if (manualResizeEdges.testFlag(Qt::TopEdge))
+        target.setTop(qMin(target.top() + delta.y(), target.bottom() - minHeight + 1));
+    if (manualResizeEdges.testFlag(Qt::BottomEdge))
+        target.setBottom(qMax(target.bottom() + delta.y(), target.top() + minHeight - 1));
+    setGeometry(target);
+}
+void Window::finishManualResize()
+{
+    manualResizeHandle = nullptr;
+    manualResizeEdges = Qt::Edges();
 }
 void Window::resizeEvent(QResizeEvent *event)
 {

@@ -89,6 +89,9 @@ class Window : public QMainWindow
     void updateCachePins();
     QJsonArray hydrateMessages(const QJsonArray &snapshot) const;
     bool hasCurrentMedia(const QJsonObject &media) const;
+    void beginManualResize(Qt::Edges edges, const QPoint &globalPos, QWidget *handle);
+    void applyManualResize(const QPoint &globalPos);
+    void finishManualResize();
     void updateComposeHeight();
     void send();
     void uploadNext(int index, quint64 generation, const QString &targetGroup);
@@ -145,6 +148,10 @@ class Window : public QMainWindow
     QTimer draftTimer, thumbnailTimer, cachePruneTimer;
     bool cacheWorking = false;
     QList<QWidget *> resizeEdges;
+    QPointer<QWidget> manualResizeHandle;
+    Qt::Edges manualResizeEdges;
+    QPoint manualResizeOrigin;
+    QRect manualResizeGeometry;
     QString groupId, serverUrl, secret, downloadRoot, nickname, clientId, pin, pendingId, demoFailure;
     QString lastError;
     QJsonArray memberCache;
