@@ -176,7 +176,23 @@ PreferencesDialog::PreferencesDialog(const Values &initial, QWidget *parent)
     theme->setCurrentIndex(savedTheme < 0 ? 0 : savedTheme);
     themeRow->addWidget(theme);
     appearance->addLayout(themeRow);
-    appearance->addWidget(description("保存后立即应用；跟随系统会随系统外观切换。"));
+    auto *wheelRow = new QHBoxLayout;
+    wheelRow->addWidget(new QLabel("滚轮速度"));
+    wheelRow->addStretch();
+    wheelSpeed = new QComboBox;
+    wheelSpeed->setObjectName("preferencesWheelSpeed");
+    wheelSpeed->setAccessibleName("鼠标滚轮滚动速度");
+    wheelSpeed->setMinimumWidth(150);
+    wheelSpeed->addItem("最慢", 0.15);
+    wheelSpeed->addItem("较慢", 0.25);
+    wheelSpeed->addItem("标准", 0.35);
+    wheelSpeed->addItem("较快", 0.5);
+    wheelSpeed->addItem("最快（系统原生）", 1.0);
+    const auto savedWheel = wheelSpeed->findData(initial.wheelDamping);
+    wheelSpeed->setCurrentIndex(savedWheel < 0 ? 2 : savedWheel);
+    wheelRow->addWidget(wheelSpeed);
+    appearance->addLayout(wheelRow);
+    appearance->addWidget(description("保存后立即应用；跟随系统会随系统外观切换。滚轮速度只影响鼠标滚轮，触控板手势保持系统原生手感。"));
     appearance->addStretch();
     pages->addWidget(appearancePage);
 
@@ -232,7 +248,8 @@ PreferencesDialog::PreferencesDialog(const Values &initial, QWidget *parent)
 PreferencesDialog::Values PreferencesDialog::values() const
 {
     return {QDir::fromNativeSeparators(directory->text()), theme->currentData().toString(),
-            sound->isChecked(), cacheLimit->currentData().toLongLong()};
+            sound->isChecked(), cacheLimit->currentData().toLongLong(),
+            wheelSpeed->currentData().toReal()};
 }
 
 void PreferencesDialog::chooseDirectory()

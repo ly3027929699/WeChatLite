@@ -1,5 +1,6 @@
 #include "media_storage.h"
 #include "preferences_dialog.h"
+#include "smooth_scroll.h"
 #include "theme.h"
 #include <QApplication>
 #include <QCheckBox>
@@ -178,6 +179,29 @@ class PreferencesTests final : public QObject
         QCOMPARE(Theme::mode(), QString("light")); // Applying and saving belong to the caller.
     }
 
+    void wheelSpeedIsOfferedOnTheAppearancePageAndReturnsTheSavedValue()
+    {
+        auto initial = defaults();
+        initial.wheelDamping = 0.5;
+        PreferencesDialog dialog(initial);
+        auto *speed = dialog.findChild<QComboBox *>("preferencesWheelSpeed");
+        QVERIFY(speed);
+        // Offering the raw 1:1 speed is what makes the wheel unusable, so it is opt-in only.
+        QCOMPARE(speed->count(), 5);
+        QCOMPARE(speed->currentData().toReal(), 0.5);
+        QCOMPARE(dialog.values().wheelDamping, 0.5);
+        // An unknown stored value falls back to the standard step instead of index 0.
+        initial.wheelDamping = 0.123;
+        PreferencesDialog fallback(initial);
+        QCOMPARE(fallback.findChild<QComboBox *>("preferencesWheelSpeed")->currentData().toReal(), 0.35);
+        QCOMPARE(fallback.values().wheelDamping, 0.35);
+        // Damping is clamped, and the smooth scroll reads it back.
+        qputenv("WECHAT_LITE_WHEEL_DAMPING", "5");
+        QCOMPARE(SmoothScroll::savedDamping(), 1.0);
+        qputenv("WECHAT_LITE_WHEEL_DAMPING", "0");
+        QCOMPARE(SmoothScroll::savedDamping(), 0.05);
+        qunsetenv("WECHAT_LITE_WHEEL_DAMPING");
+    }
     void cancelPreservesOriginalValuesAndNeverRequestsSoundAutomatically()
     {
         auto initial = defaults();
@@ -395,6 +419,51 @@ class PreferencesTests final : public QObject
         QCOMPARE(usage.cache, qint64(0));
     }
 
+    void downloadRootResolvesItsOwnAliasAndStillRejectsNestedLinks()
+    {
+        // macOS keeps ~/Downloads as a symlink onto another volume. The selected root
+        // must be stored in canonical form or every indexed download is discarded and
+        // fetched a second time, but links *below* the root stay refused.
+        QTemporaryDir tree;
+        QVERIFY(tree.isValid());
+        const auto real = QDir(QFileInfo(tree.path()).canonicalFilePath()).filePath("real-downloads");
+        QVERIFY(QDir().mkpath(real));
+        const auto alias = tree.filePath("downloads-alias");
+        std::error_code error;
+        std::filesystem::create_directory_symlink(
+            QFileInfo(real).canonicalFilePath().toStdString(), alias.toStdString(), error);
+        if (error) QSKIP("This account cannot create a directory symlink.");
+        QCOMPARE(MediaStorage::resolveRoot(alias), QFileInfo(real).canonicalFilePath());
+        // A not-yet-created child resolves the existing part and keeps the rest.
+        const auto missing = QDir(alias).filePath("2026-10-22");
+        QCOMPARE(MediaStorage::resolveRoot(missing),
+                 QDir(QFileInfo(real).canonicalFilePath()).filePath("2026-10-22"));
+        // Plain paths are unchanged, and the canonical root is indexable as before.
+        QCOMPARE(MediaStorage::resolveRoot(real), QFileInfo(real).canonicalFilePath());
+        const auto contents = QByteArray("delivered");
+        const auto descriptor = media("alias-id", "image", "点开的图片.png", contents);
+        const auto path = QDir(real).filePath("点开的图片.png");
+        QVERIFY(store(path, contents));
+        const auto resolved = MediaStorage::resolveRoot(alias);
+        MediaStorage::LocalFiles files("alias-scope", QDir(QFileInfo(tree.path()).canonicalFilePath()).filePath("index"));
+        files.remember("g", descriptor, path);
+        QVERIFY2(!files.find("g", descriptor).isEmpty(),
+                 "A root resolved through its own alias must stay indexed.");
+        QCOMPARE(QDir(resolved).filePath("点开的图片.png"), files.find("g", descriptor));
+        // Nesting a link below the root is still rejected by the index.
+        const auto nestedTarget = QDir(QFileInfo(tree.path()).canonicalFilePath()).filePath("outside");
+        QVERIFY(QDir().mkpath(nestedTarget));
+        const auto nested = QDir(real).filePath("nested");
+        std::error_code nestedError;
+        std::filesystem::create_directory_symlink(
+            QFileInfo(nestedTarget).canonicalFilePath().toStdString(), nested.toStdString(), nestedError);
+        if (nestedError) return;
+        const auto hidden = QDir(nested).filePath("hidden.png");
+        QVERIFY(store(hidden, contents));
+        const auto nestedDescriptor = media("nested-id", "image", "hidden.png", contents);
+        files.remember("g", nestedDescriptor, hidden);
+        QVERIFY(files.find("g", nestedDescriptor).isEmpty());
+    }
     void chosenDownloadRootResolvesAliasButNestedLinksAreSkipped()
     {
         const auto outside = currentFiles->filePath("outside");

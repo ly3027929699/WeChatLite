@@ -1,6 +1,7 @@
 #pragma once
 #include "attachment.h"
 #include "chat_preferences.h"
+#include "message_cache.h"
 #include "recall_drafts.h"
 #include "transport.h"
 #include "tunnel_session.h"
@@ -82,6 +83,11 @@ class Window : public QMainWindow
     void updateUnreadTotal();
     void markConversationRead();
     void selectGroup(const QString &id, const QString &name);
+    // Paints the stored rows of the current group before the first history page.
+    void restoreCachedMessages();
+    void storeCachedMessages();
+    void scheduleCacheWrite();
+    void initializeMessageCache();
     void loadHistory(bool older = false, int pendingAttempt = 0);
     void loadMembers();
     void activateCurrentGroup();
@@ -157,6 +163,9 @@ class Window : public QMainWindow
     QJsonObject p2pSettings;
     RecallDrafts recallDrafts;
     ChatPreferences chatPreferences;
+    // Last known rows per conversation, so opening one does not start blank.
+    MessageCache messageCache;
+    bool cacheReady = false;
     QSet<QByteArray> seenMessages;
     QQueue<QByteArray> seenMessageOrder;
     bool notificationsSynced = false;
@@ -167,7 +176,7 @@ class Window : public QMainWindow
     quint64 locateGeneration = 0;
     QProcess demoServer;
     QSystemTrayIcon tray;
-    QTimer draftTimer, thumbnailTimer, cachePruneTimer;
+    QTimer draftTimer, thumbnailTimer, cachePruneTimer, cacheWriteTimer;
     bool cacheWorking = false;
     bool composeDragging = false, screenWatching = false;
     int composeHeightPreference = 0, composeDragHeight = 0;

@@ -181,15 +181,24 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     serverUrl = settings.value("serverUrl").toString();
     secret = settings.value("token").toString();
     nickname = settings.value("nickname", "我").toString();
-    downloadRoot =
+    // Store the canonical form of the selected root. ~/Downloads is a symlink onto
+    // another volume on many Macs, and every index write rejects aliased paths, so
+    // keeping the alias made each download impossible to remember and therefore
+    // fetched again on every click.
+    const auto configuredDownloads =
         settings
             .value("downloads",
                    QStandardPaths::writableLocation(QStandardPaths::DownloadLocation) + "/微信轻聊")
             .toString();
+    downloadRoot = MediaStorage::resolveRoot(configuredDownloads);
+    // Write the resolved form back so the setting, the delivered paths and the media
+    // index all agree from now on, instead of silently differing on every launch.
+    if (downloadRoot != configuredDownloads) settings.setValue("downloads", downloadRoot);
     pin = settings.value("certificatePin").toString();
     p2pSettings = QJsonDocument::fromJson(settings.value("p2p").toByteArray()).object();
     chatPreferences.configure(serverUrl, secret);
     localFiles = std::make_shared<MediaStorage::LocalFiles>(chatPreferences.scope());
+    initializeMessageCache();
     clientId = settings.value("clientId").toString();
     if (clientId.isEmpty())
     {
@@ -228,6 +237,9 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     thumbnailTimer.setInterval(180);
     thumbnailTimer.setSingleShot(true);
     connect(&thumbnailTimer, &QTimer::timeout, this, &Window::visibleThumbnails);
+    cacheWriteTimer.setSingleShot(true);
+    cacheWriteTimer.setInterval(800);
+    connect(&cacheWriteTimer, &QTimer::timeout, this, &Window::storeCachedMessages);
     cachePruneTimer.setSingleShot(true);
     cachePruneTimer.setInterval(1000);
     connect(&cachePruneTimer, &QTimer::timeout, this, [this]
@@ -304,6 +316,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                 }
                 else
                 {
+                    storeCachedMessages();
                     selfMemberId.clear();
                     invalidateAuxiliaryWindows();
                     historyButton->setEnabled(false);
@@ -371,6 +384,12 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     connect(model, &QAbstractItemModel::dataChanged, this, &Window::updateCachePins);
     connect(model, &QAbstractItemModel::modelReset, this, &Window::refreshForwardRecord);
     connect(model, &QAbstractItemModel::dataChanged, this, &Window::refreshForwardRecord);
+    // Everything that changes the list also refreshes the snapshot opened with, but
+    // coalesced: a burst of live messages must not rewrite the file per row.
+    connect(model, &QAbstractItemModel::modelReset, this, &Window::scheduleCacheWrite);
+    connect(model, &QAbstractItemModel::dataChanged, this, &Window::scheduleCacheWrite);
+    connect(model, &QAbstractItemModel::rowsInserted, this, &Window::scheduleCacheWrite);
+    connect(model, &QAbstractItemModel::rowsRemoved, this, &Window::scheduleCacheWrite);
     connect(&demoServer, &QProcess::readyReadStandardError, this,
             [this]
             {
@@ -425,6 +444,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
             {
                 quitting = true;
                 saveDraft();
+                storeCachedMessages();
                 transport.disconnectService();
                 tunnel.stop();
                 if (demoServer.state() != QProcess::NotRunning)
@@ -960,7 +980,8 @@ void Window::showPreferences()
     }
     invalidateAuxiliaryWindows();
     auto *dialog = new PreferencesDialog({downloadRoot, Theme::mode(),
-        QSettings().value("notificationSound", true).toBool(), MediaStorage::cacheLimit()}, this);
+        QSettings().value("notificationSound", true).toBool(), MediaStorage::cacheLimit(),
+        SmoothScroll::savedDamping()}, this);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     preferencesDialog = dialog;
     const auto scanGeneration = std::make_shared<std::atomic<quint64>>(0);
@@ -995,11 +1016,13 @@ void Window::showPreferences()
             invalidateAuxiliaryWindows();
             localFiles = std::make_shared<MediaStorage::LocalFiles>(chatPreferences.scope());
         }
-        downloadRoot = values.downloads;
+        downloadRoot = MediaStorage::resolveRoot(values.downloads);
         QSettings settings;
         settings.setValue("downloads", downloadRoot);
         settings.setValue("notificationSound", values.notificationSound);
         settings.setValue("mediaCacheLimit", values.cacheLimitBytes);
+        settings.setValue("wheelDamping", values.wheelDamping);
+        SmoothScroll::refreshAll();
         Theme::apply(values.theme);
         refreshThemeIcons();
         cachePruneTimer.start();
@@ -1119,6 +1142,71 @@ QJsonArray Window::hydrateMessages(const QJsonArray &snapshot) const
     for (const auto &message : snapshot)
         result.append(localFiles->hydrate(message.toObject(), groupId));
     return result;
+}
+void Window::initializeMessageCache()
+{
+    // The test binaries drive fixtures that expect an empty conversation right after a switch,
+    // and a cache shared between runs would make those expectations depend on history. Off means
+    // off: no disk file, and no in-process rows either.
+    cacheWriteTimer.stop();
+    if (QStandardPaths::isTestModeEnabled())
+    {
+        messageCache.configure(QString());
+        cacheReady = false;
+        return;
+    }
+    cacheReady = messageCache.configure(chatPreferences.scope());
+}
+void Window::scheduleCacheWrite()
+{
+    // Restarting the timer per row would let a busy conversation postpone the write
+    // forever, so a burst is coalesced into the first 800 ms window.
+    // While the reader is looking at an older window the model no longer holds the
+    // newest page; keeping the previous snapshot is better than caching that window.
+    if (!cacheReady || groupId.isEmpty() || cacheWriteTimer.isActive() ||
+        messages->property("locatedHistory").toBool())
+        return;
+    cacheWriteTimer.start();
+}
+void Window::storeCachedMessages()
+{
+    cacheWriteTimer.stop();
+    if (!cacheReady || groupId.isEmpty() || messages->property("locatedHistory").toBool())
+        return;
+    QList<QJsonObject> rows;
+    rows.reserve(model->rows.size());
+    for (const auto &row : model->rows)
+        if (row["group"].toString() == groupId)
+            rows.append(row);
+    // An empty model usually means the first page has not arrived (or failed), not
+    // that the conversation has no messages, so it must not erase a usable snapshot.
+    if (rows.isEmpty())
+        return;
+    // Written as-is: this is the window the list actually shows, so reopening paints
+    // the same rows instead of a union with a previous session's window.
+    messageCache.write(groupId, rows);
+}
+void Window::restoreCachedMessages()
+{
+    if (!cacheReady || groupId.isEmpty() || !model->rows.isEmpty())
+        return;
+    const auto cached = messageCache.read(groupId);
+    if (cached.isEmpty())
+        return;
+    QJsonArray snapshot;
+    for (const auto &row : cached)
+    {
+        // Counted as seen so a replay of these rows after reconnect cannot notify again.
+        rememberMessage(row);
+        snapshot.append(row);
+    }
+    model->replace(hydrateMessages(snapshot));
+    messages->setProperty("locatedHistory", false);
+    // Leaves the list exactly where a blank open would be: at the newest row, so the
+    // first history page takes the "replace the window" branch and never merges into it.
+    messages->scrollToBottom();
+    refreshReeditLinks();
+    thumbnailTimer.start();
 }
 void Window::recoverCachedMessages(const QJsonArray &snapshot, std::function<void()> callback)
 {
@@ -1273,7 +1361,7 @@ void Window::showSettings()
         nickname = name->text().trimmed().left(64);
         if (nickname.isEmpty())
             nickname = "我";
-        downloadRoot = directory->text();
+        downloadRoot = MediaStorage::resolveRoot(directory->text());
         pin = fingerprint->text();
         QSettings settings;
         settings.setValue("serverUrl", serverUrl);
@@ -1424,6 +1512,9 @@ void Window::cancelSend()
 }
 void Window::clearConversation()
 {
+    // Before `locatedHistory` is cleared below: a conversation showing an older window
+    // must not be saved as if that window were the newest page.
+    storeCachedMessages();
     invalidateAuxiliaryWindows();
     historyButton->setEnabled(false);
     announcementButton->setEnabled(false);
@@ -1465,12 +1556,16 @@ void Window::clearConversation()
 }
 void Window::connectService()
 {
+    // Persist the conversation still on screen before the identity (and with it the
+    // cache scope) changes, so one server's rows never land in another's file.
+    storeCachedMessages();
     selfMemberId.clear();
     notificationsSynced = false;
     notificationSyncSeq = 0;
     if (chatPreferences.configure(serverUrl, secret))
     {
         localFiles = std::make_shared<MediaStorage::LocalFiles>(chatPreferences.scope());
+        initializeMessageCache();
         seenMessages.clear();
         seenMessageOrder.clear();
     }
@@ -1603,7 +1698,12 @@ void Window::loadGroups()
                       updateUnreadTotal();
                       sortGroups();
                       if (!previous.isEmpty() && !selected)
+                      {
+                          // The admin revoked this conversation: its rows are no longer
+                          // readable, so the local copy goes with it.
+                          messageCache.remove(previous);
                           clearConversation();
+                      }
                       groups->blockSignals(false);
                       if (!activated)
                           pendingActivatedGroup.clear();
@@ -2014,6 +2114,7 @@ void Window::selectGroup(const QString &id, const QString &name)
     }
     invalidateAuxiliaryWindows();
     saveDraft();
+    storeCachedMessages();
     stopVoice();
     openRequests.clear();
     saveRequests.clear();
@@ -2052,6 +2153,7 @@ void Window::selectGroup(const QString &id, const QString &name)
     composer->setMembers({});
     restoreDraft();
     model->replace({});
+    restoreCachedMessages();
     loadHistory();
     loadMembers();
     activateCurrentGroup();
@@ -2112,6 +2214,8 @@ void Window::loadHistory(bool older, int pendingAttempt)
             else
             {
                 const auto *bar = messages->verticalScrollBar();
+                // Cached rows are already painted, so "was at the bottom" is the only signal that
+                // the newest page may replace them; a reader scrolled up keeps their window.
                 const bool followLatest = model->rows.isEmpty() ||
                     (!messages->property("locatedHistory").toBool() &&
                      !messages->scrollAnimationActive() && bar->maximum() - bar->value() <= 2);
@@ -2135,8 +2239,12 @@ void Window::loadHistory(bool older, int pendingAttempt)
                     // Refresh existing rows and fill unused capacity, retaining every current ID.
                     QJsonArray retained;
                     QHash<QString, int> positions;
+                    // Only this conversation: switching groups leaves the previous rows in place
+                    // until the model is emptied, and carrying them over would duplicate them.
                     for (const auto &message : model->rows)
                     {
+                        if (message["group"].toString() != id)
+                            continue;
                         positions.insert(message["id"].toString(), int(retained.size()));
                         retained.append(message);
                     }
@@ -2237,6 +2345,7 @@ void Window::handleEvent(const QJsonObject &event)
         invalidateAuxiliaryWindows();
         notificationsSynced = false;
         notificationSyncSeq = 0;
+        restoreCachedMessages();
         loadHistory();
         loadGroups();
     }
@@ -3223,6 +3332,7 @@ void Window::closeEvent(QCloseEvent *event)
     if (!isMinimized()) QSettings().setValue("windowBounds", isMaximized() ? normalGeometry() : geometry());
     stopVoice();
     saveDraft();
+    storeCachedMessages();
     if (!quitting && demoServer.state() != QProcess::NotRunning && QSystemTrayIcon::isSystemTrayAvailable())
     {
         hide();

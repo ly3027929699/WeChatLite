@@ -1,5 +1,6 @@
 #include "attachment.h"
 #include "composer.h"
+#include "message_cache.h"
 #include "messages.h"
 #include "recall_drafts.h"
 #include "wechat_emoji.h"
@@ -1002,7 +1003,10 @@ class ClientTests : public QObject
         QCOMPARE(bar->value(), 900);
         wheel(-120);
         QCOMPARE(animation->state(), QAbstractAnimation::Running);
-        wheel(0, QPoint(0, -23)); // Keep native touchpad pixel scrolling and its inertia.
+        // A phase-tagged pan is a real trackpad gesture: leave its native inertia alone.
+        QWheelEvent pan(QPointF(20, 20), view.viewport()->mapToGlobal(QPoint(20, 20)), QPoint(0, -23),
+                        QPoint(0, -23), Qt::NoButton, Qt::NoModifier, Qt::ScrollUpdate, false);
+        QApplication::sendEvent(view.viewport(), &pan);
         QCOMPARE(animation->state(), QAbstractAnimation::Stopped);
         wheel(-120);
         model.prepend({QJsonObject{{"id", "older"}, {"seq", -1}, {"text", "older"}}});
@@ -1011,6 +1015,51 @@ class ClientTests : public QObject
         QSignalSpy latest(&view, &MessageView::latestRequested);
         QTest::keyClick(&view, Qt::Key_End);
         QCOMPARE(latest.count(), 1);
+    }
+    void preciseWheelDeltasAreDampedInsteadOfScrolledOneToOne()
+    {
+        MessageModel model;
+        QJsonArray history;
+        for (int i = 0; i < 200; ++i)
+            history.append(QJsonObject{{"id", QString::number(i)}, {"seq", i + 1}, {"text", "history"}});
+        model.replace(history);
+        MessageView view;
+        view.resize(500, 400);
+        view.setModel(&model);
+        view.show();
+        auto *bar = view.verticalScrollBar();
+        auto *animation = view.findChild<QVariantAnimation *>("smoothScrollAnimation");
+        QVERIFY(animation);
+        QTRY_VERIFY(bar->maximum() > 1500);
+        // A driver-smoothed wheel reports precise pixel deltas without a scroll phase. At 1:1
+        // one observed notch (~56 px) flew past several messages; damped it must stay modest.
+        auto precise = [&view](const QPoint &pixels)
+        {
+            QWheelEvent event(QPointF(20, 20), view.viewport()->mapToGlobal(QPoint(20, 20)), pixels,
+                              QPoint(0, pixels.y() * 2), Qt::NoButton, Qt::NoModifier,
+                              Qt::NoScrollPhase, false);
+            QApplication::sendEvent(view.viewport(), &event);
+        };
+        bar->setValue(1000);
+        precise(QPoint(0, -56));
+        QCOMPARE(animation->state(), QAbstractAnimation::Running);
+        QVERIFY(animation->endValue().toReal() > 1000);
+        QVERIFY(animation->endValue().toReal() - 1000 < 56); // Damped, never the raw distance.
+        QVERIFY(animation->endValue().toReal() - 1000 >= 4); // Still a usable step.
+        const auto firstTarget = animation->endValue().toReal();
+        // Successive small deltas accumulate instead of restarting from the current position.
+        precise(QPoint(0, -12));
+        QVERIFY(animation->endValue().toReal() > firstTarget);
+        // A discrete notch keeps working and scales with the viewport, not with row height.
+        bar->setValue(1000);
+        QWheelEvent notch(QPointF(20, 20), view.viewport()->mapToGlobal(QPoint(20, 20)), {},
+                          QPoint(0, -120), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QApplication::sendEvent(view.viewport(), &notch);
+        QCOMPARE(animation->state(), QAbstractAnimation::Running);
+        const qreal notchTravel = animation->endValue().toReal() - 1000;
+        QVERIFY(notchTravel > 0);
+        // Godot's page/8 * 0.3 keeps a notch well under a full page.
+        QVERIFY(notchTravel < bar->pageStep() * 0.5);
     }
     void imageQuoteLabelsHideLegacyNativeMetadata()
     {
@@ -2136,6 +2185,160 @@ class ClientTests : public QObject
         QVERIFY(model.rows.first()["media"].toArray().isEmpty());
         model.setLocalPoster("retained-video", poster, changed);
         QVERIFY(model.rows.first()["media"].toArray().isEmpty());
+    }
+    void messageCacheKeepsOnlyRenderableRows()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        MessageCache cache("scope-a", directory.path());
+        QVERIFY(cache.persistent());
+        QJsonObject message{{"id", "m1"}, {"group", "g1"}, {"sender", "成员"}, {"text", "第一行\n第二行\t"},
+            {"timestamp", 1000}, {"status", "received"}, {"outgoing", false}, {"seq", 7},
+            {"_can_reedit", true}, {"_local", "/tmp/secret"}, {"avatar", "data"}};
+        message["media"] = QJsonArray{QJsonObject{{"id", "a1"}, {"kind", "image"}, {"name", "a.jpg"},
+            {"size", 12}, {"sha256", QString(64, 'a')}, {"_local", "/tmp/secret"}, {"path", "/etc/passwd"}}};
+        message["quote"] = QJsonObject{{"id", "m0"}, {"sender", "B"}, {"text", "引用"}};
+        message["mentions"] = QJsonArray{QJsonObject{{"id", "u1"}, {"name", "C"}, {"_path", "/x"}}};
+        cache.write("g1", {message});
+        const auto rows = cache.read("g1");
+        QCOMPARE(rows.size(), 1);
+        const auto &row = rows.first();
+        QCOMPARE(row["text"].toString(), QString("第一行\n第二行\t"));
+        QVERIFY(!row.contains("_can_reedit"));
+        QVERIFY(!row.contains("_local"));
+        QCOMPARE(row["quote"].toObject()["text"].toString(), QString("引用"));
+        QVERIFY(!row["quote"].toObject().contains("_local"));
+        QVERIFY(!row["mentions"].toArray().first().toObject().contains("_path"));
+        const auto media = row["media"].toArray().first().toObject();
+        QVERIFY(!media.contains("_local"));
+        QVERIFY(!media.contains("path"));
+        QCOMPARE(media["sha256"].toString(), QString(64, 'a'));
+        // The row cap is the newest window, not the first rows written.
+        QList<QJsonObject> many;
+        for (int i = 0; i < 400; ++i)
+            many.append({{"id", "n" + QString::number(i)}, {"group", "g1"}, {"sender", "A"},
+                {"text", QString::number(i)}, {"timestamp", i}, {"status", "received"}});
+        cache.write("g1", many);
+        const auto trimmed = cache.read("g1");
+        QCOMPARE(trimmed.size(), MessageCacheLimits::rows);
+        QCOMPARE(trimmed.last()["id"].toString(), QString("n399"));
+        QCOMPARE(trimmed.first()["id"].toString(), QString("n280"));
+        // Recalled rows keep the status but never the body.
+        cache.write("g1", {{{"id", "r1"}, {"group", "g1"}, {"sender", "A"}, {"text", "已撤回的正文"},
+            {"timestamp", 900}, {"status", "recalled"}, {"media", QJsonArray{}}}});
+        const auto recalled = cache.read("g1").first();
+        QCOMPARE(recalled["status"].toString(), QString("recalled"));
+        QVERIFY(recalled["text"].toString().isEmpty());
+        QVERIFY(!recalled.contains("media"));
+    }
+    void messageCacheShrinksRatherThanWritingNothing()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        MessageCache cache("scope-e", directory.path());
+        // Avatars are near the per-row cap, so a full window cannot fit the file cap.
+        // The oldest rows are dropped instead of skipping the write entirely.
+        const auto avatar = QString(46 * 1024, 'A');
+        QList<QJsonObject> rows;
+        for (int i = 0; i < 120; ++i)
+            rows.append({{"id", "big" + QString::number(i)}, {"group", "g"}, {"sender", "A"},
+                {"text", "x"}, {"timestamp", i}, {"seq", i + 1}, {"status", "received"},
+                {"avatar", avatar}});
+        cache.write("g", rows);
+        const auto stored = cache.read("g");
+        QVERIFY(!stored.isEmpty());
+        QVERIFY(stored.size() < 120);
+        // What is kept is the newest end, and still reads back from a new instance.
+        QCOMPARE(stored.last()["id"].toString(), QString("big119"));
+        MessageCache reloaded("scope-e", directory.path());
+        QCOMPARE(reloaded.read("g").size(), stored.size());
+    }
+    void messageCacheRejectsUnusableInput()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        MessageCache cache("scope-b", directory.path());
+        // A short hash is not a descriptor this client can resolve; the whole row would
+        // render with a broken attachment, so it is dropped instead.
+        QVERIFY(MessageCache::sanitize({{"id", "m"}, {"group", "g"}, {"sender", "A"}, {"text", "x"},
+            {"timestamp", 1}, {"status", "received"},
+            {"media", QJsonArray{QJsonObject{{"id", "a"}, {"kind", "image"}, {"name", "a"}, {"size", 3},
+                {"sha256", "abc"}}}}}).isEmpty());
+        // A legacy descriptor without a hash still renders.
+        QVERIFY(!MessageCache::sanitize({{"id", "m"}, {"group", "g"}, {"sender", "A"}, {"text", "x"},
+            {"timestamp", 1}, {"status", "received"},
+            {"media", QJsonArray{QJsonObject{{"id", "a"}, {"kind", "image"}, {"name", "a"}, {"size", 3}}}}})
+                .isEmpty());
+        QVERIFY(MessageCache::sanitize({{"id", "m"}, {"group", "g"}, {"sender", "A"}, {"text", "x"},
+            {"timestamp", 1}, {"status", "unsupported"}}).isEmpty());
+        QVERIFY(MessageCache::sanitize({{"id", "m"}, {"group", "g"}, {"sender", "A"},
+            {"text", QString(QChar::Null)}, {"timestamp", 1}, {"status", "received"}}).isEmpty());
+        QVERIFY(MessageCache::sanitize({{"id", QString(600, 'x')}, {"group", "g"}, {"sender", "A"},
+            {"text", "x"}, {"timestamp", 1}, {"status", "received"}}).isEmpty());
+        // Another group's rows must not leak into this conversation.
+        cache.write("g1", {{{"id", "m"}, {"group", "g2"}, {"sender", "A"}, {"text", "x"},
+            {"timestamp", 1}, {"status", "received"}}});
+        QVERIFY(cache.read("g1").isEmpty());
+        QVERIFY(cache.read("g2").isEmpty());
+    }
+    void messageCacheSurvivesCorruptionAndScopeChanges()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        {
+            MessageCache cache("scope-c", directory.path());
+            cache.write("g1", {{{"id", "m"}, {"group", "g1"}, {"sender", "A"}, {"text", "x"},
+                {"timestamp", 1}, {"status", "received"}, {"seq", 4}}});
+            QCOMPARE(cache.read("g1").size(), 1);
+        }
+        // A new instance reads the file the previous one committed.
+        {
+            MessageCache cache("scope-c", directory.path());
+            const auto rows = cache.read("g1");
+            QCOMPARE(rows.size(), 1);
+            QCOMPARE(rows.first()["seq"].toInteger(), qint64(4));
+        }
+        // A different scope (another server/account) sees nothing.
+        {
+            MessageCache cache("scope-d", directory.path());
+            QVERIFY(cache.read("g1").isEmpty());
+        }
+        // Corrupt JSON, a foreign version and a truncated object all read as empty.
+        MessageCache probe("scope-c", directory.path());
+        const auto directoryPath = QDir(directory.path()).filePath(
+            "message-index/" + probe.scope().left(32) + "/messages");
+        QVERIFY(QFileInfo(directoryPath).isDir());
+        const auto entries = QDir(directoryPath).entryList({"*.json"}, QDir::Files);
+        QCOMPARE(entries.size(), 1);
+        const auto path = QDir(directoryPath).filePath(entries.first());
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("{not json");
+        }
+        {
+            MessageCache cache("scope-c", directory.path());
+            QVERIFY(cache.read("g1").isEmpty());
+        }
+        {
+            MessageCache cache("scope-c", directory.path());
+            QJsonObject stored{{"version", 2}, {"scope", cache.scope()}, {"group", "g1"},
+                {"messages", QJsonArray{QJsonObject{{"id", "m"}}}}};
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write(QJsonDocument(stored).toJson(QJsonDocument::Compact));
+        }
+        {
+            MessageCache cache("scope-c", directory.path());
+            QVERIFY(cache.read("g1").isEmpty());
+        }
+        // Without a scope nothing touches the disk at all.
+        MessageCache memory(QString(), directory.path());
+        QVERIFY(!memory.persistent());
+        memory.write("g1", {{{"id", "m"}, {"group", "g1"}, {"sender", "A"}, {"text", "x"},
+            {"timestamp", 1}, {"status", "received"}}});
+        QCOMPARE(memory.read("g1").size(), 1);
+        QCOMPARE(QDir(directoryPath).entryList({"*.json"}, QDir::Files).size(), entries.size());
     }
     void sharedAvatarUsesSmallJpegAndRejectsInvalidData()
     {

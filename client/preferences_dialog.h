@@ -18,6 +18,8 @@ class PreferencesDialog : public QDialog
         QString theme = "system";
         bool notificationSound = true;
         qint64 cacheLimitBytes = 512LL * 1024 * 1024;
+        // Wheel damping: 1.0 is raw speed, lower is slower. See SmoothScroll.
+        qreal wheelDamping = 0.35;
     };
     explicit PreferencesDialog(const Values &initial, QWidget *parent = nullptr);
     Values values() const;
@@ -42,7 +44,7 @@ class PreferencesDialog : public QDialog
     void clearCache();
     void updateUsageState();
     QLineEdit *directory;
-    QComboBox *theme, *cacheLimit;
+    QComboBox *theme, *cacheLimit, *wheelSpeed;
     QCheckBox *sound;
     QLabel *downloadsUsage, *cacheUsage, *usageStatus, *validation;
     QPushButton *choose, *refresh, *clear, *preview;
